@@ -29,6 +29,15 @@ export async function VideoWeiXinChannel(data: SyncData) {
   }
 
   /**
+   * 解析视频号所在的根节点（视频号运行在 wujie 微前端的 shadow DOM 内）
+   * @returns wujie-app 的 shadowRoot；若不存在则回退到 document
+   */
+  function getRoot(): Document | ShadowRoot {
+    const wujieApp = document.querySelector("wujie-app");
+    return wujieApp?.shadowRoot || document;
+  }
+
+  /**
    * 等待元素出现，支持Shadow DOM查询
    * @param selector - CSS选择器
    * @param timeout - 超时时间（毫秒）
@@ -151,6 +160,15 @@ export async function VideoWeiXinChannel(data: SyncData) {
   }
 
   /**
+   * 等待元素出现但不抛错：超时返回 null，避免单个字段缺失中断整个发布流程
+   * @param selector - CSS选择器
+   * @param timeout - 超时时间（毫秒）
+   */
+  async function waitForElementOptional(selector: string, timeout = 8000): Promise<Element | null> {
+    return waitForElement(selector, timeout).catch(() => null);
+  }
+
+  /**
    * 上传视频文件
    * @param file - 视频文件
    */
@@ -249,107 +267,112 @@ export async function VideoWeiXinChannel(data: SyncData) {
   }
 
   /**
-   * 上传视频封面
-   * @param cover 封面图片信息
+   * 把图片文件塞进指定的 file input 并触发 change/input
+   * @param fileInput - 目标 input[type=file]
+   * @param cover - 封面图片信息
+   * @returns 是否成功设置文件
    */
-  // 按视频宽高比挑选封面(注入函数无法 import 共享工具,内联实现):横版优先横封面、竖版优先竖封面,回退 cover
-  async function pickCoverByAspect(
-    videoFile: FileData | undefined,
-    coverImg?: FileData,
-    horizontalCoverImg?: FileData,
-    verticalCoverImg?: FileData,
-  ): Promise<FileData | undefined> {
-    if (!horizontalCoverImg && !verticalCoverImg) return coverImg;
-    let isLandscape = false;
-    if (videoFile?.url) {
-      const dims = await new Promise<{ width: number; height: number } | null>((resolve) => {
-        const probe = document.createElement("video");
-        probe.preload = "metadata";
-        probe.onloadedmetadata = () => resolve({ width: probe.videoWidth, height: probe.videoHeight });
-        probe.onerror = () => resolve(null);
-        probe.src = videoFile.url;
-      });
-      if (dims) isLandscape = dims.width > dims.height;
-    }
-    return isLandscape
-      ? horizontalCoverImg || coverImg || verticalCoverImg
-      : verticalCoverImg || coverImg || horizontalCoverImg;
+  async function setCoverFile(fileInput: HTMLInputElement, cover: FileData): Promise<boolean> {
+    if (!cover.type?.includes("image/")) return false;
+    const response = await fetch(cover.url);
+    const arrayBuffer = await response.arrayBuffer();
+    const imageFile = new File([arrayBuffer], cover.name, { type: cover.type });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(imageFile);
+    if (dataTransfer.files.length === 0) return false;
+    fileInput.files = dataTransfer.files;
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
   }
 
-  async function uploadCover(cover: { url: string; name: string; type?: string }): Promise<void> {
+  /**
+   * 上传竖封面（主封面）。对齐 aibeike：入口 div.cover-preview-wrap，等待竖封面蒙层消失后上传
+   * @param cover - 封面图片信息
+   * @param root - 根节点（Document 或 ShadowRoot）
+   */
+  async function uploadCover(cover: FileData, root: Document | ShadowRoot): Promise<void> {
     try {
       console.debug("tryCover", cover);
-
-      const coverUploadButton = (await waitForElement("div.video-cover div.tag-inner")) as HTMLElement;
-      console.debug("coverUpload", coverUploadButton);
-
+      const coverUploadButton = root.querySelector("div.cover-preview-wrap > div") as HTMLElement | null;
+      console.debug("coverUpload -->", coverUploadButton);
       if (!coverUploadButton) return;
 
-      while (coverUploadButton.parentElement?.classList.contains("disabled")) {
-        console.debug("coverUpload is disabled, wait 3s");
+      // 视频未处理完时封面区会有竖封面蒙层，等它消失再点
+      for (let i = 0; i < 20; i++) {
+        const mask = root.querySelector("div.vertical-mask-layer");
+        if (!mask) break;
+        console.debug("mask is found, wait 3s");
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
 
       coverUploadButton.click();
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await waitForElementOptional("div.cover-control-wrap");
 
-      const wujieApp = document.querySelector("wujie-app");
-      const root = wujieApp?.shadowRoot || document;
-
-      const fileInput = root.querySelector("div.crop-area input[type='file']") as HTMLInputElement;
-
+      const fileInput = root.querySelector("div.cover-control-wrap input[type='file']") as HTMLInputElement | null;
       if (!fileInput) {
         console.error("封面上传文件输入框未找到");
         return;
       }
-      console.debug("fileInput", fileInput);
 
-      const dataTransfer = new DataTransfer();
-      if (cover.type?.includes("image/")) {
-        console.debug("try upload file", cover);
-        const response = await fetch(cover.url);
-        const arrayBuffer = await response.arrayBuffer();
-        const imageFile = new File([arrayBuffer], cover.name, {
-          type: cover.type,
-        });
-        dataTransfer.items.add(imageFile);
-      }
-
-      if (dataTransfer.files.length === 0) return;
-
-      fileInput.files = dataTransfer.files;
-      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-      fileInput.dispatchEvent(new Event("input", { bubbles: true }));
-      console.debug("文件上传操作触发");
+      const ok = await setCoverFile(fileInput, cover);
+      if (!ok) return;
+      console.debug("竖封面上传操作触发");
 
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
-      const h3s = root.querySelectorAll("h3");
-      console.debug("h3s", h3s);
-      const cropTitle = Array.from(h3s).find((h) => h.textContent === "裁剪封面图");
-
-      if (cropTitle) {
-        console.debug("h3", cropTitle);
-        const doneButtons = root.querySelectorAll("div.finder-dialog-footer button");
-        console.debug("doneButtons", doneButtons);
-        const doneButton = Array.from(doneButtons).find((b) => b.textContent === "确定") as HTMLButtonElement;
-        if (doneButton) {
-          console.debug("doneButton", doneButton);
-          doneButton.click();
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-      }
-
-      const finalConfirmButtons = root.querySelectorAll("div.finder-dialog-footer button");
-      console.debug("doneButtons", finalConfirmButtons);
-      const confirmButton = Array.from(finalConfirmButtons).find((b) => b.textContent === "确认") as HTMLButtonElement;
-
+      const buttons = root.querySelectorAll("div.finder-dialog-footer button");
+      const confirmButton = Array.from(buttons).find((b) => b.textContent === "确认") as HTMLButtonElement | undefined;
       if (confirmButton) {
-        console.debug("doneButton", confirmButton);
         confirmButton.click();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     } catch (error) {
       console.error("uploadCover failed:", error);
+    }
+  }
+
+  /**
+   * 上传横封面。对齐 aibeike：入口 div.horizon-img-wrap div.edit-btn → 直接编辑按钮 → 上传
+   * @param cover - 横封面图片信息
+   * @param root - 根节点（Document 或 ShadowRoot）
+   */
+  async function uploadCoverHorizontal(cover: FileData, root: Document | ShadowRoot): Promise<void> {
+    try {
+      console.debug("tryCoverHorizon", cover);
+      const editButton = root.querySelector("div.horizon-img-wrap div.edit-btn") as HTMLElement | null;
+      console.debug("coverUpload -->", editButton);
+      if (!editButton) return;
+
+      editButton.click();
+      await waitForElementOptional("div.btn-directly-edit");
+
+      const directlyEditButton = root.querySelector("div.btn-directly-edit > button") as HTMLButtonElement | null;
+      console.debug("editBtn -->", directlyEditButton);
+      if (!directlyEditButton) return;
+
+      directlyEditButton.click();
+      await waitForElementOptional("div.cover-control-wrap");
+
+      const fileInput = root.querySelector("div.cover-control-wrap input[type='file']") as HTMLInputElement | null;
+      if (!fileInput) {
+        console.error("横封面上传文件输入框未找到");
+        return;
+      }
+
+      const ok = await setCoverFile(fileInput, cover);
+      if (!ok) return;
+      console.debug("横封面上传操作触发");
+
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      const buttons = root.querySelectorAll("div.finder-dialog-footer button");
+      const confirmButton = Array.from(buttons).find((b) => b.textContent === "确认") as HTMLButtonElement | undefined;
+      if (confirmButton) {
+        confirmButton.click();
+      }
+    } catch (error) {
+      console.error("uploadCoverHorizontal failed:", error);
     }
   }
 
@@ -362,8 +385,13 @@ export async function VideoWeiXinChannel(data: SyncData) {
       cover,
       horizontalCover,
       verticalCover,
+      description,
       scheduledPublishTime,
     } = data.data as VideoData;
+
+    // 等待 wujie-app 与文件输入框就绪，再解析一次根节点（后续字段统一从该根节点同步查询，对齐 aibeike）
+    await waitForElement('input[type="file"]');
+    const root = getRoot();
 
     // 处理视频上传
     if (video) {
@@ -376,28 +404,35 @@ export async function VideoWeiXinChannel(data: SyncData) {
       console.log("视频上传已初始化");
     }
 
-    // 等待视频上传完成
+    // 等待视频上传完成、标题/描述表单渲染出来
     await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    // 处理标题输入
-    const titleInput = (await waitForElement(
+    // 处理标题输入（找不到不报错，避免中断后续字段填充）
+    const titleInput = (await waitForElementOptional(
       'input[placeholder="概括视频主要内容，字数建议6-16个字符"]',
-    )) as HTMLInputElement;
-    titleInput.value = title;
-    titleInput.dispatchEvent(new Event("input", { bubbles: true }));
+    )) as HTMLInputElement | null;
+    if (titleInput) {
+      titleInput.value = title || "";
+      titleInput.dispatchEvent(new Event("input", { bubbles: true }));
+      console.log("标题已填写:", title);
+    } else {
+      console.error("未找到视频号标题输入框");
+    }
 
     // 处理内容和标签输入
-    const descriptionInput = (await waitForElement('div[data-placeholder="添加描述"]')) as HTMLDivElement;
+    const descriptionInput = (await waitForElementOptional(
+      'div[data-placeholder="添加描述"]',
+    )) as HTMLDivElement | null;
 
     if (descriptionInput) {
-      // 输入主要内容
+      // 输入主要内容（content 优先，回退 description）
       descriptionInput.focus();
       const pasteEvent = new ClipboardEvent("paste", {
         bubbles: true,
         cancelable: true,
         clipboardData: new DataTransfer(),
       });
-      pasteEvent.clipboardData.setData("text/plain", content || "");
+      pasteEvent.clipboardData.setData("text/plain", content || description || "");
       descriptionInput.dispatchEvent(pasteEvent);
 
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -429,41 +464,28 @@ export async function VideoWeiXinChannel(data: SyncData) {
 
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
+    } else {
+      console.error("未找到视频号描述输入框");
     }
 
-    const chosenCover = await pickCoverByAspect(video, cover, horizontalCover, verticalCover);
-    if (chosenCover) {
-      await uploadCover(chosenCover);
-    }
-
-    // 处理原创声明
-    const originalInput = (await waitForElement(
+    // 处理原创声明（对齐 aibeike：先勾选，再在声明弹窗内勾选并点「声明原创」）
+    const originalInput = root.querySelector(
       'input[type="checkbox"][class="ant-checkbox-input"]',
-    )) as HTMLInputElement;
+    ) as HTMLInputElement | null;
 
     if (originalInput) {
       originalInput.click();
       await new Promise((resolve) => setTimeout(resolve, 1000));
 
-      // 在shadow-root中查找声明输入框
-      const wujieApp = document.querySelector("wujie-app");
-      let declareInput: HTMLInputElement | null = null;
-
-      if (wujieApp?.shadowRoot) {
-        declareInput = wujieApp.shadowRoot.querySelector(
-          'div.declare-body-wrapper input[type="checkbox"][class="ant-checkbox-input"]',
-        ) as HTMLInputElement;
-      }
+      const declareInput = root.querySelector(
+        'div.declare-body-wrapper input[type="checkbox"][class="ant-checkbox-input"]',
+      ) as HTMLInputElement | null;
 
       if (declareInput) {
         declareInput.click();
         await new Promise((resolve) => setTimeout(resolve, 1000));
 
-        // 在shadow-root中查找声明原创按钮
-        const buttons =
-          wujieApp?.shadowRoot?.querySelectorAll('button[type="button"]') ||
-          document.querySelectorAll('button[type="button"]');
-
+        const buttons = root.querySelectorAll('button[type="button"]');
         for (const button of Array.from(buttons)) {
           if (button.textContent === "声明原创") {
             console.log("点击声明原创按钮");
@@ -475,13 +497,20 @@ export async function VideoWeiXinChannel(data: SyncData) {
       }
     }
 
-    const wujieApp = document.querySelector("wujie-app");
-    const root = wujieApp?.shadowRoot || document;
-
     // 处理定时发布
     if (scheduledPublishTime) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       await setScheduledPublishTime(scheduledPublishTime, root);
+    }
+
+    // 处理封面：对齐 aibeike，竖封面 + 横封面分别上传
+    const mainCover = cover || verticalCover;
+    if (mainCover) {
+      await uploadCover(mainCover, root);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    if (horizontalCover) {
+      await uploadCoverHorizontal(horizontalCover, root);
     }
 
     if (data.isAutoPublish === true) {
